@@ -1,0 +1,93 @@
+// file: 01_scalar_single_core.mlu
+
+#include <bang.h>
+
+#define ELEM_NUM 10 * 1000 * 1000
+
+float src1_cpu[ELEM_NUM];
+float src2_cpu[ELEM_NUM];
+float dst_cpu[ELEM_NUM];
+
+__mlu_entry__ void kernel(float *output, float *a, float *b, int data_num) {
+  if (data_num == 0) {
+    return;
+  }
+  for (int i = 0; i < data_num; i++) {
+    // TODO: 请补充标量加法运算的表达式
+    output[i]=a[i]+b[i]; // scalar add
+  }
+  return;
+}
+
+void policyFunction(cnrtDim3_t *dim, cnrtFunctionType_t *func_type) {
+  // TODO: 请补充单核任务的Kernel函数类型
+  *func_type = CNRT_FUNC_TYPE_BLOCK; // single core
+  dim->x = 1;
+  dim->y = 1;
+  dim->z = 1;
+  return;
+}
+
+int main() {
+  CNRT_CHECK(cnrtSetDevice(0));
+  cnrtNotifier_t st, et;
+  CNRT_CHECK(cnrtNotifierCreate(&st));
+  CNRT_CHECK(cnrtNotifierCreate(&et));
+  cnrtQueue_t queue;
+  // TODO: 请补充调用运行时接口创建异步Queue的函数调用
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim;
+  cnrtFunctionType_t func_type;
+  policyFunction(&dim, &func_type);
+
+  // 1.0f + 1.0f = 2.0f
+  for (unsigned i = 0; i < ELEM_NUM; ++i) {
+    src1_cpu[i] = 1.0f;
+    src2_cpu[i] = 1.0f;
+  }
+  float* src1_mlu = NULL;
+  float* src2_mlu = NULL;
+  float* dst_mlu = NULL;
+  CNRT_CHECK(cnrtMalloc((void **)&src1_mlu, ELEM_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void **)&src2_mlu, ELEM_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void **)&dst_mlu, ELEM_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMemcpy(src1_mlu, src1_cpu, ELEM_NUM * sizeof(float),
+                        cnrtMemcpyHostToDev));
+  CNRT_CHECK(cnrtMemcpy(src2_mlu, src2_cpu, ELEM_NUM * sizeof(float),
+                        cnrtMemcpyHostToDev));
+  CNRT_CHECK(cnrtPlaceNotifier(st, queue));
+  kernel<<<dim, func_type, queue>>>(dst_mlu, src1_mlu, src2_mlu, ELEM_NUM);
+  CNRT_CHECK(cnrtPlaceNotifier(et, queue));
+  // TODO: 请补充调用运行时接口同步Queue的操作
+  CNRT_CHECK(cnrtQueueSync(queue));
+  CNRT_CHECK(cnrtMemcpy(dst_cpu, dst_mlu, ELEM_NUM * sizeof(float),
+                        cnrtMemcpyDevToHost));
+  float latency;
+  // TODO: 请补充调用运行时接口统计硬件耗时的函数调用
+  CNRT_CHECK(cnrtNotifierDuration(st, et, &latency));
+  CNRT_CHECK(cnrtFree(src1_mlu));
+  CNRT_CHECK(cnrtFree(src2_mlu));
+  CNRT_CHECK(cnrtFree(dst_mlu));
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  float diff = 0.0;
+  float baseline = 2.0;
+  for (unsigned i = 0; i < ELEM_NUM; ++i) {
+    diff += fabs(dst_cpu[i] - baseline);
+  }
+  double theory_io = ELEM_NUM * 4.0 * 3.0; // bytes
+  double theory_ops = ELEM_NUM * 4.0; // ops
+  // ops_per_core/ns * core_num_per_cluter * cluster_num
+  double peak_compute_force = 128 * 4 * 8;
+  double io_bandwidth = 307.2; // bytes/ns
+  double io_efficiency = theory_io / (latency * 1000) / io_bandwidth;
+  double cp_efficiency = theory_ops / (latency * 1000) / peak_compute_force;
+  printf("[MLU Hardware Time ]: %.3f us\n", latency);
+  printf("[MLU IO Efficiency ]: %f\n", io_efficiency);
+  printf("[MLU Compute Efficiency]: %f\n", cp_efficiency);
+  printf("[MLU Diff Rate ]: %f\n", diff);
+  printf(diff == 0 ? "PASSED\n" : "FAILED\n");
+
+  return 0;
+}
