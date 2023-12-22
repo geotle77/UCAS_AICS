@@ -1,0 +1,125 @@
+// file: 02_vector_single_core.mlu
+
+#include <bang.h>
+
+#define ELEM_NUM 10 * 1000 * 1000
+#define MAX_NRAM_SIZE 655360
+#define NFU_ALIGN_SIZE 128
+
+__nram__ uint8_t nram_buffer[MAX_NRAM_SIZE];
+
+float src1_cpu[ELEM_NUM];
+float src2_cpu[ELEM_NUM];
+float dst_cpu[ELEM_NUM];
+
+__mlu_entry__ void kernel(float *output, float *a, float *b, int data_num) {
+  if (data_num == 0) {
+    return;
+  }
+  uint32_t align_num = NFU_ALIGN_SIZE / sizeof(float);
+  uint32_t data_ram_num =
+    MAX_NRAM_SIZE / sizeof(float) / 2 / align_num * align_num;
+  float *a_ram = (float *)nram_buffer;
+  float *b_ram = (float *)a_ram + data_ram_num;
+  // TODO: 请补充计算循环次数的表达式
+  uint32_t loop_time = data_num / data_ram_num;
+  // TODO: 请补充非data_ram_num对齐的元素个数计算表达式
+  uint32_t rem_ram_num = data_num % data_ram_num;
+
+  for (int i = 0; i < loop_time; i++) {
+    // load
+    __memcpy(a_ram, a + i * data_ram_num,
+             data_ram_num * sizeof(float), GDRAM2NRAM);
+    __memcpy(b_ram, b + i * data_ram_num,
+             data_ram_num * sizeof(float), GDRAM2NRAM);
+    // TODO: 请补充BANG内置向量加法函数签名
+    __bang_add(a_ram, a_ram, b_ram, data_ram_num); // vector add
+    // store
+    __memcpy(output + i * data_ram_num, a_ram,
+             data_ram_num * sizeof(float), NRAM2GDRAM);
+  }
+  if (rem_ram_num != 0) {
+    uint32_t rem_align_num =
+      (rem_ram_num + align_num - 1) / align_num * align_num;
+    // load
+    __memcpy(a_ram, a + loop_time * data_ram_num,
+             rem_ram_num * sizeof(float), GDRAM2NRAM);
+    __memcpy(b_ram, b + loop_time * data_ram_num,
+             rem_ram_num * sizeof(float), GDRAM2NRAM);
+    // compute
+    __bang_add(a_ram, a_ram, b_ram, rem_align_num);
+    // store
+    __memcpy(output + loop_time * data_ram_num, a_ram,
+           rem_ram_num * sizeof(float), NRAM2GDRAM);
+  }
+  return;
+}
+
+void policyFunction(cnrtDim3_t *dim, cnrtFunctionType_t *func_type) {
+  *func_type = CNRT_FUNC_TYPE_BLOCK; // single core
+  dim->x = 1;
+  dim->y = 1;
+  dim->z = 1;
+  return;
+}
+
+int main() {
+  CNRT_CHECK(cnrtSetDevice(0));
+  cnrtNotifier_t st, et;
+  CNRT_CHECK(cnrtNotifierCreate(&st));
+  CNRT_CHECK(cnrtNotifierCreate(&et));
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim;
+  cnrtFunctionType_t func_type;
+  policyFunction(&dim, &func_type);
+
+  // 1.0f + 1.0f = 2.0f
+  for (unsigned i = 0; i < ELEM_NUM; ++i) {
+    src1_cpu[i] = 1.0f;
+    src2_cpu[i] = 1.0f;
+  }
+  float* src1_mlu = NULL;
+  float* src2_mlu = NULL;
+  float* dst_mlu = NULL;
+  CNRT_CHECK(cnrtMalloc((void **)&src1_mlu, ELEM_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void **)&src2_mlu, ELEM_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void **)&dst_mlu, ELEM_NUM * sizeof(float)));
+  CNRT_CHECK(cnrtMemcpy(src1_mlu, src1_cpu, ELEM_NUM * sizeof(float),
+                        cnrtMemcpyHostToDev));
+  CNRT_CHECK(cnrtMemcpy(src2_mlu, src2_cpu, ELEM_NUM * sizeof(float),
+                        cnrtMemcpyHostToDev));
+  CNRT_CHECK(cnrtPlaceNotifier(st, queue));
+  kernel<<<dim, func_type, queue>>>(dst_mlu, src1_mlu, src2_mlu, ELEM_NUM);
+  CNRT_CHECK(cnrtPlaceNotifier(et, queue));
+  CNRT_CHECK(cnrtQueueSync(queue));
+  CNRT_CHECK(cnrtMemcpy(dst_cpu, dst_mlu, ELEM_NUM * sizeof(float),
+                        cnrtMemcpyDevToHost));
+  float latency;
+  CNRT_CHECK(cnrtNotifierDuration(st, et, &latency));
+  CNRT_CHECK(cnrtFree(src1_mlu));
+  CNRT_CHECK(cnrtFree(src2_mlu));
+  CNRT_CHECK(cnrtFree(dst_mlu));
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  float diff = 0.0;
+  float baseline = 2.0;
+  for (unsigned i = 0; i < ELEM_NUM; ++i) {
+    diff += fabs(dst_cpu[i] - baseline);
+  }
+  double theory_io = ELEM_NUM * 4.0 * 3.0; // bytes
+  double theory_ops = ELEM_NUM * 4.0; // ops
+  // ops_per_core/ns * core_num_per_cluter * cluster_num
+  double peak_compute_force = 128 * 4 * 8;
+  double io_bandwidth = 307.2; // bytes/ns
+  double io_efficiency = theory_io / (latency * 1000) / io_bandwidth;
+  double cp_efficiency = theory_ops / (latency * 1000) / peak_compute_force;
+  printf("[MLU Hardware Time ]: %.3f us\n", latency);
+  printf("[MLU IO Efficiency ]: %f\n", io_efficiency);
+  printf("[MLU Compute Efficiency]: %f\n", cp_efficiency);
+  printf("[MLU Diff Rate ]: %f\n", diff);
+  printf(diff == 0 ? "PASSED\n" : "FAILED\n");
+
+  return 0;
+}
